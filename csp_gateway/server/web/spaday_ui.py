@@ -102,7 +102,6 @@ _WORKSPACE_TAB = "workspace"
 _SEND_TAB = "send"
 _TOAST_ID = "gateway-toasts"
 _ACTION_RESULT = "action_result"
-_GRAPH_FOCUS = "graph_focus"
 _PERSPECTIVE_READY = "perspective_ready"
 _SHARED_LAYOUT_ID = "shared_layout_id"
 _SHARED_LAYOUT_PARAM = "layout"
@@ -541,21 +540,21 @@ class GatewayUI:
         schemas: dict[str, dict[str, str]] | None = None,
         default_layout: dict[str, Any] | None = None,
         table_options: dict[str, dict[str, Any]] | None = None,
-        channels: dict[str, dict[str, Any]] | None = None,
-        master_theme: str | None = None,
+        panel_defaults: dict[str, dict[str, Any]] | None = None,
         shared_layouts_route: str | None = None,
     ) -> Any:
-        """A Perspective workspace panel (the primary data view), bound to the theme + `view` state.
+        """A Perspective workspace panel (the primary data view), bound to the `view` state.
 
         Data rides Perspective's own websocket at ``route``; the panel only carries the workspace
-        layout/theme config. ``default_layout`` replaces the generated initial layout when supplied.
+        config. ``default_layout`` replaces the generated initial layout when supplied.
         Otherwise ``default_tables`` are the ones the generated layout opens, defaulting to all of
         ``tables``. ``schemas`` (table name -> column name -> type) lets the generated layout apply
         per-table defaults (timestamp sort, hidden id column). ``table_options`` carries each table's
-        ``architecture``/``index``/``limit``, which is what puts a ``client-server`` table in a local
-        worker rather than reading it off the websocket. ``channels`` supplies configurations for
-        channels opened through the panel's picker or ``openChannel`` method. Add it to `Region.MAIN`.
-        ``master_theme`` overrides the theme of filter-source panels; other panels follow the page theme.
+        ``architecture``, which is what puts a ``client-server`` table in a local worker rather than
+        reading it off the websocket; the local copy inherits the server table's index or limit.
+        ``panel_defaults`` (table name -> panel configuration) is how a table opens in a new panel,
+        from the panel's table picker or `focus_table_action`; every table defaults to its panel in
+        the generated layout. The panels follow the page's light/dark mode. Add it to `Region.MAIN`.
         ``shared_layouts_route`` serves layouts by id; a page opened with ``?layout=<id>`` starts on it.
         """
         tables = list(tables or [])
@@ -600,11 +599,6 @@ class GatewayUI:
             self.bind_url(**{_SHARED_LAYOUT_ID: _SHARED_LAYOUT_PARAM})
             layout_expr = cond(eq(field("shared_layout.id"), field(_SHARED_LAYOUT_ID)), field("shared_layout.config"), layout_expr)
 
-        # Focusing a table (from a channels-graph node) wins over the selected layout until the
-        # selector or a save clears it, so these branches wrap the others.
-        for name in tables:
-            layout_expr = cond(eq(field(_GRAPH_FOCUS), name), self._default_layout([name], schemas=schemas), layout_expr)
-        self._store_seeds.setdefault(_GRAPH_FOCUS, "")
         self._store_seeds.setdefault(_PERSPECTIVE_READY, False)
         self._store_seeds.setdefault("saved_layout", None)
         self.persist_store(saved_layout=_CUSTOM_LAYOUT_STORAGE_KEY)
@@ -613,16 +607,14 @@ class GatewayUI:
             PerspectivePanel()
             .prop("id", _WORKSPACE_ID)
             .style(height="100%", display="block", overflow="hidden")
-            .compute("theme", cond(field("dark"), "dark", "light"))
             .compute(
                 "config",
                 obj(
                     {
                         "ws_url": self.url(route),
                         "tables": table_specs,
-                        "layout": layout_expr,
-                        "channels": channels or {},
-                        "master_theme": master_theme,
+                        "workspace": layout_expr,
+                        "panel_defaults": {**{name: self._default_panel(name, schemas) for name in tables}, **(panel_defaults or {})},
                     }
                 ),
             )
@@ -667,16 +659,18 @@ class GatewayUI:
     def focus_table_action(self, *, event_path: str = "detail.id") -> Any:
         """An action that shows one table in the workspace, named by ``event_path`` on the event.
 
-        For components that identify a channel (the channels graph's node clicks). Names that are
-        not workspace tables are ignored, so clicking a module does nothing. Returns ``None`` when
-        no workspace has been registered, so callers can skip binding it.
+        For components that identify a channel (the channels graph's node clicks). The workspace
+        comes forward and selects the table's panel, opening one from its `panel_defaults` when the
+        layout has none, so the rest of the user's layout is kept. Names that are not workspace
+        tables are ignored, so clicking a module does nothing. Returns ``None`` when no workspace has
+        been registered, so callers can skip binding it.
         """
         if not self._workspace_tables:
             return None
         name = event_prop(event_path)
         return If(
             any_(*[eq(name, table) for table in self._workspace_tables]),
-            Sequence(SetField(_GRAPH_FOCUS, name), Invoke(by_id(_MAIN_LAYOUT_ID), "openPanel", _WORKSPACE_TAB)),
+            Sequence(Invoke(by_id(_MAIN_LAYOUT_ID), "openPanel", _WORKSPACE_TAB), Invoke(by_id(_WORKSPACE_ID), "showTable", name)),
         )
 
     def layout_selector(self, layouts: dict[str, str], *, value: str | None = None) -> Any:
@@ -688,7 +682,7 @@ class GatewayUI:
             WaSelect(value=value, size="s")
             .prop("id", "gateway-layout-selector")
             .bind("value", "view", mode="two-way")
-            .on("change", Sequence(SetField("layout_view", event_value()), SetField(_GRAPH_FOCUS, ""), SetField(_SHARED_LAYOUT_ID, "")))
+            .on("change", Sequence(SetField("layout_view", event_value()), SetField(_SHARED_LAYOUT_ID, "")))
             .style(width="220px")
         )
         select = select.child(WaOption(value="__default__").text("All Tables"))
@@ -699,8 +693,9 @@ class GatewayUI:
     def save_layout_button(self) -> Any:
         """A header button that saves the current Perspective workspace in the browser.
 
-        `saveClean` strips the transient fields (theme, column size overrides) before the layout is
-        persisted to localStorage. Saving updates the custom layout and selects it.
+        `saveWorkspace` leaves out the generated row-action columns and keeps the last configuration
+        of each closed table, so the layout persisted to localStorage restores as it was saved.
+        Saving updates the custom layout and selects it.
         """
         return (
             WaButton(appearance="plain", title="Save current layout")
@@ -708,9 +703,8 @@ class GatewayUI:
             .on(
                 "click",
                 Sequence(
-                    Invoke(by_id(_WORKSPACE_ID), "saveClean", result="custom_layout"),
+                    Invoke(by_id(_WORKSPACE_ID), "saveWorkspace", result="custom_layout"),
                     SetField("saved_layout", field("custom_layout")),
-                    SetField(_GRAPH_FOCUS, ""),
                     SetField(_SHARED_LAYOUT_ID, ""),
                     SetField("view", _CUSTOM_LAYOUT_NAME),
                     SetField("layout_view", _CUSTOM_LAYOUT_NAME),
@@ -722,7 +716,7 @@ class GatewayUI:
     def download_layout_button(self) -> Any:
         """A header button that downloads the current Perspective workspace as a JSON file.
 
-        The file is assembled client-side from `saveClean` — no server round-trip.
+        The file is assembled client-side from `saveWorkspace` — no server round-trip.
         """
         return (
             WaButton(appearance="plain", title="Download layout")
@@ -730,7 +724,7 @@ class GatewayUI:
             .on(
                 "click",
                 Sequence(
-                    Invoke(by_id(_WORKSPACE_ID), "saveClean", result="download_layout"),
+                    Invoke(by_id(_WORKSPACE_ID), "saveWorkspace", result="download_layout"),
                     Download("layout.json", field("download_layout")),
                 ),
             )
@@ -748,7 +742,7 @@ class GatewayUI:
             .on(
                 "click",
                 Sequence(
-                    Invoke(by_id(_WORKSPACE_ID), "saveClean", result="share_layout"),
+                    Invoke(by_id(_WORKSPACE_ID), "saveWorkspace", result="share_layout"),
                     CallEndpoint("POST", self.url(route), field("share_layout"), result="share_layout_result"),
                     If(
                         field("share_layout_result.ok"),
@@ -870,6 +864,18 @@ class GatewayUI:
         return result
 
     @staticmethod
+    def _default_panel(table: str, schemas: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+        """How ``table`` opens in a panel: a datagrid titled by the table, sorted by ``timestamp``
+        descending when the table has one, and with the ``id`` column hidden."""
+        panel: dict[str, Any] = {"plugin": "Datagrid", "title": table}
+        schema = (schemas or {}).get(table) or {}
+        if "timestamp" in schema:
+            panel["sort"] = [["timestamp", "desc"]]
+        if "id" in schema:
+            panel["columns"] = [column for column in schema if column != "id"]
+        return panel
+
+    @staticmethod
     def _default_layout(tables: list[str], schemas: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
         """A perspective workspace config that shows every table in its own datagrid tab.
 
@@ -880,13 +886,7 @@ class GatewayUI:
         panel_ids: list[str] = []
         for i, table in enumerate(tables):
             panel_id = f"CSP_GATEWAY_{i}"
-            panel: dict[str, Any] = {"table": table, "plugin": "Datagrid", "title": table}
-            schema = (schemas or {}).get(table) or {}
-            if "timestamp" in schema:
-                panel["sort"] = [["timestamp", "desc"]]
-            if "id" in schema:
-                panel["columns"] = [column for column in schema if column != "id"]
-            panels[panel_id] = panel
+            panels[panel_id] = {"table": table, **GatewayUI._default_panel(table, schemas)}
             panel_ids.append(panel_id)
         return {
             "layout": {"type": "tab-layout", "tabs": panel_ids, "selected": 0},

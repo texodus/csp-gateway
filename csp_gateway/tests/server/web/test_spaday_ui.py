@@ -622,18 +622,18 @@ class TestDefaultLayout:
         }
 
         panel = ui.perspective_panel(route="/perspective", tables=["orders"], default_layout=custom)
-        layout = panel.to_node()["bindings"]["config"]["compute"]["fields"]["layout"]
+        layout = panel.to_node()["bindings"]["config"]["compute"]["fields"]["workspace"]
 
-        # The layout is a cond chain (focus branches, then the saved layout); the final `else` is
-        # the default, and it is the supplied one rather than a generated CSP_GATEWAY_* layout.
+        # The workspace is a cond chain (shared, custom and server layouts); the final `else` is the
+        # default, and it is the supplied one rather than a generated CSP_GATEWAY_* layout.
         while layout.get("expr") == "cond":
             layout = layout["else"]
         assert layout["value"] == custom
 
 
 class TestTableOptions:
-    """Per-table `architecture`/`index`/`limit` reach the panel, which is what mirrors a
-    `client-server` table into a local worker instead of reading it off the websocket."""
+    """Per-table `architecture` reaches the panel, which is what mirrors a `client-server` table
+    into a local worker instead of reading it off the websocket."""
 
     @staticmethod
     def _table_specs(panel):
@@ -643,13 +643,21 @@ class TestTableOptions:
         panel = _bare_ui().perspective_panel(route="/perspective", tables=["orders"])
         assert self._table_specs(panel) == ["orders"]
 
-    @pytest.mark.parametrize("master_theme", [None, "Sidebar"])
-    def test_channel_defaults_and_storage_are_configured_from_python(self, master_theme):
+    def test_panel_defaults_and_storage_are_configured_from_python(self):
         ui = _bare_ui()
-        channels = {"orders": {"table": "orders", "columns": ["quantity"]}}
-        panel = ui.perspective_panel(route="/perspective", tables=["orders"], channels=channels, master_theme=master_theme)
-        assert panel.to_node()["bindings"]["config"]["compute"]["fields"]["channels"]["value"] == channels
-        assert panel.to_node()["bindings"]["config"]["compute"]["fields"]["master_theme"]["value"] == master_theme
+        defaults = {"orders": {"columns": ["quantity"]}}
+        schemas = {"orders": {"id": "string", "quantity": "integer"}, "fills": {"timestamp": "datetime", "price": "float"}}
+        panel = ui.perspective_panel(route="/perspective", tables=["orders", "fills"], schemas=schemas, panel_defaults=defaults)
+        fields = panel.to_node()["bindings"]["config"]["compute"]["fields"]
+
+        # A table without its own defaults opens the way the generated layout shows it.
+        assert fields["panel_defaults"]["value"] == {
+            "orders": {"columns": ["quantity"]},
+            "fills": {"plugin": "Datagrid", "title": "fills", "sort": [["timestamp", "desc"]]},
+        }
+        # Spaday Perspective's canonical keys, and no theme: the panels follow the page's mode.
+        assert "layout" not in fields and "channels" not in fields and "master_theme" not in fields
+        assert "theme" not in panel.to_node().get("bindings", {})
         assert ui._store_persistence == {"saved_layout": "csp_gateway_demo_config"}
         ui.persist_store(legacy_layout="old-layout")
         assert ui._store_persistence["legacy_layout"] == "old-layout"
@@ -667,21 +675,16 @@ class TestTableOptions:
             "fills",
         ]
 
-    def test_module_reports_effective_architecture_index_and_limit(self):
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"indexes": {"example": "id"}}, {"indexes": {"example": ["a", "b"]}}, {"limits": {"example": 5}, "default_index": "id"}],
+    )
+    def test_module_reports_only_the_effective_architecture(self, kwargs):
+        # The client-side replica inherits the server table's index or limit, so neither is sent.
         module = MountPerspectiveTables(
-            channel_selection=["example"],
-            default_architecture="server",
-            architectures={"example": "client-server"},
-            indexes={"example": "id"},
-            limits={"example": 5},
+            channel_selection=["example"], default_architecture="server", architectures={"example": "client-server"}, **kwargs
         )
-        assert module._ui_table_options("example") == {"architecture": "client-server", "index": "id", "limit": 5}
-
-    def test_multi_index_table_reports_the_computed_index(self):
-        module = MountPerspectiveTables(channel_selection=["example"], indexes={"example": ["a", "b"]})
-        module._computed_indexes["example"] = ("a-b", ["a", "b"])
-
-        assert module._ui_table_options("example")["index"] == "a-b"
+        assert module._ui_table_options("example") == {"architecture": "client-server"}
 
 
 class TestActionFailureToast:
@@ -768,7 +771,7 @@ class TestWorkspaceSignals:
 
 
 class TestGraphFocus:
-    """Clicking a channel in the graph shows that one table in the workspace."""
+    """Clicking a channel in the graph shows that table in the workspace, keeping the user's layout."""
 
     def test_no_action_without_a_workspace(self):
         assert _bare_ui().focus_table_action() is None
@@ -781,22 +784,20 @@ class TestGraphFocus:
         # Only the workspace's own tables focus anything, so clicking a module node is a no-op.
         assert [branch["b"]["value"] for branch in action["cond"]["of"]] == ["orders", "fills"]
         assert action["cond"]["expr"] == "any"
-        # Focusing also brings the workspace back to the front.
-        assert '"openPanel"' in json.dumps(action["then"]) and '"workspace"' in json.dumps(action["then"])
+        # Focusing brings the workspace to the front, then asks it to show the clicked table.
+        steps = action["then"]["actions"]
+        assert steps[0]["method"] == "openPanel" and steps[0]["args"][0]["value"] == "workspace"
+        assert steps[1]["target"]["id"] == "gateway-workspace" and steps[1]["method"] == "showTable"
+        assert steps[1]["args"][0] == {"expr": "event-prop", "path": "detail.id"}
 
-    def test_layout_has_a_focus_branch_per_table(self):
+    def test_focus_leaves_the_layout_alone(self):
         ui = _bare_ui()
         node = json.dumps(ui.perspective_panel(route="/perspective", tables=["orders", "fills"]).to_node())
 
-        assert node.count('"name": "graph_focus"') == 2
-        assert ui._store_seeds["graph_focus"] == ""
-
-    def test_selecting_a_layout_clears_the_focus(self):
-        change = _bare_ui().layout_selector({}).to_node()["events"]["change"]
-
-        # Picking a layout has to drop the focus, or the focused table would outrank the choice.
-        cleared = [a for a in change["actions"] if a.get("field") == "graph_focus"]
-        assert cleared and cleared[0]["value"] == {"expr": "lit", "value": ""}
+        # The workspace changes in place, so the configured layout carries no focus branches.
+        assert "graph_focus" not in node
+        assert "graph_focus" not in ui._store_seeds
+        assert "graph_focus" not in json.dumps(ui.layout_selector({}).to_node())
 
 
 class TestDarkBoot:
@@ -855,7 +856,7 @@ class TestSpadayPerspectiveLayoutActions:
         assert "gateway-layout-selector" in tree
         assert "layout_view" in tree
         assert "Save current layout" in tree
-        assert '"method": "saveClean"' in tree
+        assert '"method": "saveWorkspace"' in tree
         assert "Download layout" in tree
         assert '"kind": "download"' in tree
 
@@ -869,12 +870,12 @@ class TestSpadayPerspectiveLayoutActions:
         assert 'localStorage.setItem("csp_gateway_demo_config", JSON.stringify(v))' in page
         assert client.get("/components/csp-gateway/actions.js").status_code == 404
         tree = client.get("/tree.json").text
-        # save: clean-save the workspace, persist it, and switch the selector to the custom layout
-        assert '"target": {"ref": "id", "id": "gateway-workspace"}, "method": "saveClean", "result": "custom_layout"' in tree
+        # save: save the workspace, persist it, and switch the selector to the custom layout
+        assert '"target": {"ref": "id", "id": "gateway-workspace"}, "method": "saveWorkspace", "result": "custom_layout"' in tree
         assert '"kind": "set-field", "field": "saved_layout", "value": {"expr": "field", "name": "custom_layout"}' in tree
         assert '"kind": "set-field", "field": "layout_view", "value": {"expr": "lit", "value": "Custom Layout"}' in tree
-        # download: clean-save, then offer the result as a client-side file
-        assert '"method": "saveClean", "result": "download_layout"' in tree
+        # download: save, then offer the result as a client-side file
+        assert '"method": "saveWorkspace", "result": "download_layout"' in tree
         assert (
             '"kind": "download", "filename": {"expr": "lit", "value": "layout.json"}, "value": {"expr": "field", "name": "download_layout"}' in tree
         )
@@ -892,6 +893,9 @@ class TestSpadayPerspectiveLayoutActions:
 
     def test_layout_download_rejects_invalid_and_oversized_content(self, client: TestClient):
         invalid = client.post("/api/v1/perspective/download-layout", data={"layout": "1"})
+        # Checked against Perspective's own schema, not just the shape.
+        unknown_key = {"layout": {"type": "tab-layout", "tabs": ["p"]}, "panels": {"p": {"table": "example", "bogus": True}}}
+        assert client.post("/api/v1/perspective/download-layout", data={"layout": json.dumps(unknown_key)}).status_code == 400
         oversized = client.post(
             "/api/v1/perspective/download-layout",
             content=b"x",
@@ -935,12 +939,27 @@ class TestSharedLayouts:
         oversized = client.post("/api/v1/perspective/shared-layouts", content=b"x", headers={"content-length": str(1024 * 1024 + 1)})
         assert oversized.status_code == 413
         assert client.get("/api/v1/perspective/shared-layouts/missing").status_code == 404
+        # Perspective's schema decides what a workspace is, so a malformed tree or panel is turned away.
+        assert client.post("/api/v1/perspective/shared-layouts", json={"layout": {"n": 1}, "panels": {}}).status_code == 400
+        bad_panel = {"layout": {"type": "tab-layout", "tabs": ["p"]}, "panels": {"p": {"table": "example", "bogus": True}}}
+        assert client.post("/api/v1/perspective/shared-layouts", json=bad_panel).status_code == 400
+
+    def test_a_saved_workspace_with_retained_panels_can_be_shared(self, client: TestClient):
+        # What the panel's `saveWorkspace` produces, including its own metadata, is accepted.
+        layout = {
+            "layout": {"type": "tab-layout", "tabs": ["p"]},
+            "panels": {"p": {"table": "example", "plugin": "Datagrid"}},
+            "retained_panel_configs_by_table": {"example_full_history": {"plugin": "Datagrid", "columns": ["x"]}},
+            "version": "5.9.1",
+        }
+        assert client.post("/api/v1/perspective/shared-layouts", json=layout).status_code == 200
 
     def test_shared_layouts_are_bounded(self, gateway, client: TestClient, monkeypatch):
         from csp_gateway.server.modules.web import perspective
 
         monkeypatch.setattr(perspective, "_MAX_SHARED_LAYOUTS", 2)
-        ids = [client.post("/api/v1/perspective/shared-layouts", json={"layout": {"n": n}, "panels": {}}).json()["id"] for n in range(3)]
+        layouts = [{"layout": {"type": "tab-layout", "tabs": [], "selected": n}, "panels": {}} for n in range(3)]
+        ids = [client.post("/api/v1/perspective/shared-layouts", json=layout).json()["id"] for layout in layouts]
 
         assert client.get(f"/api/v1/perspective/shared-layouts/{ids[0]}").status_code == 404
         assert client.get(f"/api/v1/perspective/shared-layouts/{ids[2]}").status_code == 200

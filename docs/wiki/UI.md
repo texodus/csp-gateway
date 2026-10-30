@@ -17,6 +17,7 @@ The top bar has several buttons on the righthand side for selecting/saving/downl
 Perspective layouts are driven via JSON.
 You can drag/drop to build your own layout, and click the save button to store it locally in your browser.
 Layouts can also be downloaded as a JSON, and integrated into the server-side configuration for sharing across multiple users.
+A configured layout saved by an older Perspective release, back to 2.0, is upgraded when the server starts, by Perspective's own migration; anything the upgrade had to drop or approximate is reported as a warning.
 
 ```yaml
 modules:
@@ -26,7 +27,7 @@ modules:
       A Layout Name: "<The JSON you downloaded>"
 ```
 
-With `share_layouts: true`, the top bar also has a share button. It stores the current layout on the server, adds `?layout=<id>` to the page URL, and copies the link. Anyone who opens the link gets that layout. Shared layouts are kept in memory, so they are lost when the server restarts; download the JSON or add it to `layouts` to keep one.
+With `share_layouts: true`, the top bar also has a share button. It stores the current layout on the server, adds `?layout=<id>` to the page URL, and copies the link. Anyone who opens the link gets that layout. Shared layouts are kept in memory, so they are lost when the server restarts; download the JSON or add it to `layouts` to keep one. The server checks a shared or downloaded layout against Perspective's schema and turns away one that the workspace could not restore.
 
 ```yaml
 modules:
@@ -42,7 +43,7 @@ The rightmost top bar button opens the settings drawer. Depending on your server
 - _"Big Red Button"_: Shut down the backend `Gateway` server
 - Email: if your server settings have an email contact, this will generate a `mailto:` link
 - Logs: if your server includes the [`MountOutputsFolder`](MountOutputsFolder) module, this will link to an integrated log and configuration viewer
-- Graph View: if your server includes the [`MountChannelsGraph`](MountChannelsGraph) module, this will link to an integrated graph viewer
+- Graph View: if your server includes the [`MountChannelsGraph`](MountChannelsGraph) module, this will link to an integrated graph viewer. Clicking a channel there shows its table in the workspace: its tab is selected, or one is opened beside the others, and the rest of the layout is kept.
 
 ## Frontend
 
